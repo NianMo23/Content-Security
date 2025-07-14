@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from peft import LoraConfig, get_peft_model, TaskType
@@ -17,6 +18,196 @@ import argparse
 from qwen3_classification_direct import Qwen3ForSequenceClassification
 import torch.multiprocessing as mp
 
+# =========================== 新增：Focal Loss实现 ===========================
+class FocalLoss(nn.Module):
+    """
+    Focal Loss实现，专门解决类别不平衡问题
+    论文：Focal Loss for Dense Object Detection
+    """
+    def __init__(self, alpha=None, gamma=2.0, num_classes=6, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.num_classes = num_classes
+        self.reduction = reduction
+        
+        # 如果提供了alpha权重，转换为张量
+        if alpha is not None:
+            if isinstance(alpha, (float, int)):
+                self.alpha = torch.ones(num_classes) * alpha
+            elif isinstance(alpha, list):
+                self.alpha = torch.tensor(alpha, dtype=torch.float32)
+            else:
+                self.alpha = alpha
+        
+    def forward(self, inputs, targets):
+        """
+        Args:
+            inputs: [N, C] 模型输出logits
+            targets: [N] 真实标签
+        """
+        # 计算交叉熵
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        
+        # 计算概率
+        pt = torch.exp(-ce_loss)  # pt = p_t
+        
+        # 应用alpha权重
+        if self.alpha is not None:
+            if self.alpha.device != targets.device:
+                self.alpha = self.alpha.to(targets.device)
+            alpha_t = self.alpha[targets]
+            focal_loss = alpha_t * (1 - pt) ** self.gamma * ce_loss
+        else:
+            focal_loss = (1 - pt) ** self.gamma * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+# =========================== 新增：加权交叉熵Loss ===========================
+class WeightedCrossEntropyLoss(nn.Module):
+    """
+    加权交叉熵损失，根据类别样本数量动态调整权重
+    """
+    def __init__(self, class_weights=None, num_classes=6):
+        super(WeightedCrossEntropyLoss, self).__init__()
+        self.num_classes = num_classes
+        
+        if class_weights is not None:
+            if isinstance(class_weights, dict):
+                # 将字典转换为张量
+                weights = torch.zeros(num_classes)
+                for class_id, weight in class_weights.items():
+                    weights[class_id] = weight
+                self.class_weights = weights
+            else:
+                self.class_weights = torch.tensor(class_weights, dtype=torch.float32)
+        else:
+            self.class_weights = None
+    
+    def forward(self, inputs, targets):
+        if self.class_weights is not None:
+            if self.class_weights.device != targets.device:
+                self.class_weights = self.class_weights.to(targets.device)
+            return F.cross_entropy(inputs, targets, weight=self.class_weights)
+        else:
+            return F.cross_entropy(inputs, targets)
+
+# =========================== 修改模型类以支持自定义损失 ===========================
+class OptimizedQwen3ForSequenceClassification(nn.Module):
+    """
+    优化版本的Qwen3分类模型，支持自定义损失函数
+    """
+    def __init__(self, model_path, num_labels=6, loss_type='focal', loss_config=None):
+        super().__init__()
+        
+        # 加载原始模型
+        self.base_model_wrapper = Qwen3ForSequenceClassification(model_path, num_labels)
+        
+        # 复制原始模型的组件（注意正确的结构）
+        self.base_model = self.base_model_wrapper.base_model  # 这是实际的Qwen3模型
+        self.dropout = self.base_model_wrapper.dropout
+        self.config = self.base_model_wrapper.config
+        self.num_labels = num_labels
+        self.hidden_size = self.base_model_wrapper.hidden_size
+        
+        self.loss_type = loss_type
+        self.loss_config = loss_config or {}
+        
+        # 初始化损失函数
+        if loss_type == 'focal':
+            alpha = self.loss_config.get('alpha', None)
+            gamma = self.loss_config.get('gamma', 2.0)
+            self.loss_fn = FocalLoss(alpha=alpha, gamma=gamma, num_classes=num_labels)
+        elif loss_type == 'weighted_ce':
+            class_weights = self.loss_config.get('class_weights', None)
+            self.loss_fn = WeightedCrossEntropyLoss(class_weights=class_weights, num_classes=num_labels)
+        elif loss_type == 'combined':
+            # 组合损失：Focal Loss + 加权交叉熵
+            alpha = self.loss_config.get('alpha', None)
+            gamma = self.loss_config.get('gamma', 2.0)
+            class_weights = self.loss_config.get('class_weights', None)
+            focal_weight = self.loss_config.get('focal_weight', 0.7)
+            ce_weight = self.loss_config.get('ce_weight', 0.3)
+            
+            self.focal_loss = FocalLoss(alpha=alpha, gamma=gamma, num_classes=num_labels)
+            self.weighted_ce_loss = WeightedCrossEntropyLoss(class_weights=class_weights, num_classes=num_labels)
+            self.focal_weight = focal_weight
+            self.ce_weight = ce_weight
+        else:
+            self.loss_fn = nn.CrossEntropyLoss()
+    
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        # 使用与原始模型相同的forward逻辑
+        # 获取Qwen3模型的基础输出（不包括lm_head）
+        
+        # 从kwargs中提取参数，避免重复传递
+        position_ids = kwargs.pop('position_ids', None)
+        past_key_values = kwargs.pop('past_key_values', None)
+        inputs_embeds = kwargs.pop('inputs_embeds', None)
+        use_cache = kwargs.pop('use_cache', None)
+        output_attentions = kwargs.pop('output_attentions', None)
+        output_hidden_states = kwargs.pop('output_hidden_states', None)
+        return_dict = kwargs.pop('return_dict', None)
+        
+        outputs = self.base_model.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=True,  # 确保输出隐藏状态
+            return_dict=True
+        )
+        
+        # 获取最后一层的隐藏状态
+        hidden_states = outputs.last_hidden_state  # [batch_size, seq_len, hidden_size]
+        
+        # 使用序列的最后一个有效token（考虑padding）
+        if attention_mask is not None:
+            # 找到每个序列的最后一个有效token位置
+            sequence_lengths = attention_mask.sum(dim=1) - 1
+            batch_size = hidden_states.shape[0]
+            sequence_hidden_states = hidden_states[
+                torch.arange(batch_size, device=hidden_states.device),
+                sequence_lengths
+            ]
+        else:
+            # 如果没有attention_mask，使用最后一个token
+            sequence_hidden_states = hidden_states[:, -1, :]
+        
+        # 应用dropout
+        pooled_output = self.dropout(sequence_hidden_states)
+        
+        # 通过分类头获取logits
+        logits = self.base_model.lm_head(pooled_output)  # [batch_size, num_labels]
+        
+        # 计算损失
+        loss = None
+        if labels is not None:
+            if self.loss_type == 'combined':
+                focal_loss = self.focal_loss(logits, labels)
+                ce_loss = self.weighted_ce_loss(logits, labels)
+                loss = self.focal_weight * focal_loss + self.ce_weight * ce_loss
+            else:
+                loss = self.loss_fn(logits, labels)
+        
+        # 返回与原始模型兼容的输出格式
+        from transformers.modeling_outputs import SequenceClassifierOutputWithPast
+        return SequenceClassifierOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values if hasattr(outputs, 'past_key_values') else None,
+            hidden_states=outputs.hidden_states if kwargs.get('output_hidden_states', False) else None,
+            attentions=outputs.attentions if kwargs.get('output_attentions', False) else None
+        )
+
 # 设置随机种子
 def set_seed(seed=23):
     np.random.seed(seed)
@@ -26,7 +217,7 @@ def set_seed(seed=23):
 # 自定义数据集类
 class ClassificationDataset(Dataset):
     def __init__(self, data_path, tokenizer, max_length=512):
-        self.data = pd.read_csv(data_path)
+        self.data = pd.read_excel(data_path)
         self.tokenizer = tokenizer
         self.max_length = max_length
         
@@ -72,6 +263,65 @@ class ClassificationDataset(Dataset):
             'attention_mask': encoding['attention_mask'].squeeze(),
             'labels': torch.tensor(label, dtype=torch.long)
         }
+
+# 计算类别权重的辅助函数
+def calculate_class_weights(train_data_path, method='inverse_freq'):
+    """
+    计算类别权重
+    
+    Args:
+        train_data_path: 训练数据路径
+        method: 计算方法 ('inverse_freq', 'balanced', 'custom')
+    
+    Returns:
+        dict: 类别权重字典
+    """
+    df = pd.read_excel(train_data_path)
+    
+    # 统计各类别样本数量
+    label_map = {'正常': 0, '歧视': 1, '违法违规': 2, '政治安全': 3, '暴恐': 4, '色情低俗': 5}
+    class_counts = {}
+    
+    for label_text in df['extracted_label']:
+        label = label_map.get(str(label_text).strip(), None)
+        if label is not None:
+            class_counts[label] = class_counts.get(label, 0) + 1
+    
+    total_samples = sum(class_counts.values())
+    num_classes = len(class_counts)
+    
+    if method == 'inverse_freq':
+        # 逆频率权重
+        class_weights = {}
+        for class_id, count in class_counts.items():
+            class_weights[class_id] = total_samples / (num_classes * count)
+    
+    elif method == 'balanced':
+        # 平衡权重
+        class_weights = {}
+        for class_id, count in class_counts.items():
+            class_weights[class_id] = total_samples / (2 * count)
+    
+    elif method == 'custom':
+        # 自定义权重，针对业务场景优化
+        max_count = max(class_counts.values())
+        class_weights = {}
+        
+        # 对违规类别给予更高权重
+        violation_classes = [1, 2, 3, 4, 5]  # 除正常类外的所有类别
+        
+        for class_id, count in class_counts.items():
+            base_weight = max_count / count
+            if class_id in violation_classes:
+                # 违规类别额外增加权重
+                if class_id == 2:  # 违法违规类，问题最严重
+                    class_weights[class_id] = base_weight * 1.5
+                else:
+                    class_weights[class_id] = base_weight * 1.2
+            else:
+                class_weights[class_id] = base_weight * 0.8  # 正常类略降权重
+    
+    return class_counts, class_weights
 
 # 评估函数
 def evaluate(model, dataloader, device, rank, use_fp16=True):
@@ -261,7 +511,7 @@ def setup_logging(rank, output_dir):
         logger.handlers.clear()
         
         # 创建文件handler
-        log_file = os.path.join(output_dir, 'training.log')
+        log_file = os.path.join(output_dir, 'training_optimized.log')
         file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
         file_handler.setLevel(logging.INFO)
         file_formatter = logging.Formatter(log_format)
@@ -280,7 +530,7 @@ def setup_logging(rank, output_dir):
         return logger
     return None
 
-def save_hyperparameters(args, output_dir, rank):
+def save_hyperparameters(args, output_dir, rank, class_counts=None, class_weights=None):
     """保存超参数配置到文件"""
     if rank == 0:  # 只在主进程保存
         import json
@@ -294,7 +544,8 @@ def save_hyperparameters(args, output_dir, rank):
                 "checkpoint": args.checkpoint,
                 "train_data": args.train_data,
                 "val_data": args.val_data,
-                "output_dir": args.output_dir
+                "output_dir": args.output_dir,
+                "optimization": "focal_loss_and_class_weights"
             },
             
             # 训练超参数
@@ -316,6 +567,16 @@ def save_hyperparameters(args, output_dir, rank):
                 "lora_alpha": args.lora_alpha,
                 "lora_dropout": args.lora_dropout,
                 "target_modules": args.target_modules
+            },
+            
+            # 损失函数配置 - 新增
+            "loss_config": {
+                "loss_type": args.loss_type,
+                "focal_gamma": args.focal_gamma,
+                "focal_alpha": args.focal_alpha,
+                "class_weight_method": args.class_weight_method,
+                "focal_weight": getattr(args, 'focal_weight', None),
+                "ce_weight": getattr(args, 'ce_weight', None)
             },
             
             # 优化器参数
@@ -348,16 +609,23 @@ def save_hyperparameters(args, output_dir, rank):
             }
         }
         
+        # 添加类别统计信息
+        if class_counts is not None:
+            hyperparams["data_analysis"] = {
+                "class_counts": class_counts,
+                "class_weights": class_weights
+            }
+        
         # 保存为JSON文件
-        config_file = os.path.join(output_dir, 'hyperparameters.json')
+        config_file = os.path.join(output_dir, 'hyperparameters_optimized.json')
         with open(config_file, 'w', encoding='utf-8') as f:
             json.dump(hyperparams, f, indent=2, ensure_ascii=False)
         
         # 同时保存为易读的文本文件
-        txt_file = os.path.join(output_dir, 'hyperparameters.txt')
+        txt_file = os.path.join(output_dir, 'hyperparameters_optimized.txt')
         with open(txt_file, 'w', encoding='utf-8') as f:
             f.write("=" * 60 + "\n")
-            f.write("训练超参数配置\n")
+            f.write("优化训练超参数配置\n")
             f.write("=" * 60 + "\n")
             f.write(f"训练时间: {hyperparams['experiment_info']['timestamp']}\n\n")
             
@@ -372,72 +640,10 @@ def save_hyperparameters(args, output_dir, rank):
         return config_file, txt_file
     return None, None
 
-def log_hyperparameters(args, logger, world_size):
-    """记录超参数到日志"""
-    if logger:
-        logger.info("=" * 80)
-        logger.info("训练超参数配置")
-        logger.info("=" * 80)
-        
-        # 基础配置
-        logger.info("基础配置:")
-        logger.info(f"  模型检查点: {args.checkpoint}")
-        logger.info(f"  训练数据: {args.train_data}")
-        logger.info(f"  验证数据: {args.val_data}")
-        logger.info(f"  输出目录: {args.output_dir}")
-        logger.info(f"  使用GPU数量: {world_size}")
-        logger.info(f"  GPU ID列表: {args.gpu_ids}")
-        
-        # 训练超参数
-        logger.info("\n训练超参数:")
-        logger.info(f"  训练轮数: {args.num_epochs}")
-        logger.info(f"  批次大小: {args.batch_size}")
-        logger.info(f"  学习率: {args.learning_rate}")
-        logger.info(f"  最大序列长度: {args.max_length}")
-        logger.info(f"  梯度累积步数: {args.gradient_accumulation_steps}")
-        logger.info(f"  预热步数: {args.warmup_steps}")
-        logger.info(f"  混合精度: {args.fp16}")
-        logger.info(f"  随机种子: {args.seed}")
-        
-        # LoRA配置
-        logger.info("\nLoRA配置:")
-        logger.info(f"  LoRA秩 (r): {args.lora_r}")
-        logger.info(f"  LoRA缩放因子 (alpha): {args.lora_alpha}")
-        logger.info(f"  LoRA dropout: {args.lora_dropout}")
-        logger.info(f"  目标模块: {args.target_modules}")
-        
-        # 优化器配置
-        logger.info("\n优化器配置:")
-        logger.info(f"  权重衰减: {args.weight_decay}")
-        logger.info(f"  Adam epsilon: {args.adam_epsilon}")
-        logger.info(f"  Adam beta1: {args.adam_beta1}")
-        logger.info(f"  Adam beta2: {args.adam_beta2}")
-        
-        # 学习率调度
-        logger.info("\n学习率调度:")
-        logger.info(f"  调度器类型: {args.scheduler_type}")
-        if hasattr(args, 'min_lr'):
-            logger.info(f"  最小学习率: {args.min_lr}")
-        if hasattr(args, 'poly_power'):
-            logger.info(f"  多项式幂次: {args.poly_power}")
-        
-        # 早停机制
-        logger.info("\n早停机制:")
-        logger.info(f"  耐心值: {args.early_stopping_patience}")
-        logger.info(f"  监控指标: {args.early_stopping_metric}")
-        
-        # 日志和保存配置
-        logger.info("\n日志和保存:")
-        logger.info(f"  日志间隔: {args.logging_steps} 步")
-        logger.info(f"  评估间隔: {args.eval_steps} 步")
-        logger.info(f"  保存间隔: {args.save_steps} 步")
-        
-        logger.info("=" * 80)
-
 def setup_distributed(rank, world_size, backend='nccl'):
     """初始化分布式训练环境"""
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+    os.environ['MASTER_PORT'] = '12357'  # 使用不同端口避免冲突
     
     # 初始化进程组
     dist.init_process_group(backend, rank=rank, world_size=world_size)
@@ -457,17 +663,14 @@ def train_worker(rank, world_size, args):
     # 设置日志记录（只在主进程）
     logger = setup_logging(rank, args.output_dir)
     
-    # 保存超参数配置
-    config_file, txt_file = save_hyperparameters(args, args.output_dir, rank)
+    # 只在主进程打印信息
+    is_main_process = rank == 0
     
-    if rank == 0:
-        logger.info(f"开始多GPU训练，使用 {world_size} 个GPU")
+    if is_main_process:
+        logger.info(f"开始优化版多GPU训练，使用 {world_size} 个GPU")
         logger.info(f"主进程运行在 rank {rank}，使用 GPU {actual_gpu_id}")
-        if config_file:
-            logger.info(f"超参数已保存到: {config_file} 和 {txt_file}")
-        
-        # 记录详细的超参数信息
-        log_hyperparameters(args, logger, world_size)
+        logger.info(f"损失函数类型: {args.loss_type}")
+        logger.info(f"类别权重方法: {args.class_weight_method}")
     
     # 设置当前GPU
     torch.cuda.set_device(actual_gpu_id)
@@ -484,9 +687,6 @@ def train_worker(rank, world_size, args):
         if rank == 0:
             logger.info(f"已清理GPU {actual_gpu_id} 缓存")
     
-    # 只在主进程打印信息
-    is_main_process = rank == 0
-    
     if is_main_process:
         logger.info(f"使用设备: {device}")
         logger.info(f"世界大小: {world_size}")
@@ -501,25 +701,81 @@ def train_worker(rank, world_size, args):
                     memory_total = torch.cuda.get_device_properties(gpu_id).total_memory / 1024**3
                     logger.info(f"GPU {gpu_id}: {memory_allocated:.2f}GB allocated, {memory_reserved:.2f}GB reserved, {memory_total:.2f}GB total")
     
+    # 计算类别权重
+    if is_main_process:
+        logger.info("计算类别权重...")
+        class_counts, class_weights = calculate_class_weights(args.train_data, method=args.class_weight_method)
+        logger.info(f"类别样本数量: {class_counts}")
+        logger.info(f"类别权重: {class_weights}")
+    else:
+        class_counts, class_weights = None, None
+    
+    # 广播类别权重到所有进程
+    if world_size > 1:
+        if is_main_process:
+            # 主进程准备数据
+            class_weights_list = [class_weights.get(i, 1.0) for i in range(6)]
+        else:
+            class_weights_list = [0.0] * 6
+        
+        # 广播
+        class_weights_tensor = torch.tensor(class_weights_list, device=device)
+        dist.broadcast(class_weights_tensor, src=0)
+        
+        # 非主进程重建权重字典
+        if not is_main_process:
+            class_weights = {i: class_weights_tensor[i].item() for i in range(6)}
+    
+    # 保存超参数配置
+    config_file, txt_file = save_hyperparameters(args, args.output_dir, rank, class_counts, class_weights)
+    
+    if is_main_process and config_file:
+        logger.info(f"超参数已保存到: {config_file} 和 {txt_file}")
+    
     # 加载tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # 加载模型
+    # 准备损失函数配置
+    loss_config = {
+        'gamma': args.focal_gamma,
+        'class_weights': class_weights
+    }
+    
+    if args.loss_type == 'focal':
+        if args.focal_alpha == 'auto':
+            # 自动计算alpha
+            loss_config['alpha'] = [class_weights.get(i, 1.0) for i in range(6)]
+        elif args.focal_alpha is not None:
+            loss_config['alpha'] = args.focal_alpha
+    elif args.loss_type == 'combined':
+        loss_config['focal_weight'] = getattr(args, 'focal_weight', 0.7)
+        loss_config['ce_weight'] = getattr(args, 'ce_weight', 0.3)
+        if args.focal_alpha == 'auto':
+            loss_config['alpha'] = [class_weights.get(i, 1.0) for i in range(6)]
+        elif args.focal_alpha is not None:
+            loss_config['alpha'] = args.focal_alpha
+    
+    # 加载优化后的模型
     if is_main_process:
-        logger.info("正在加载模型...")
+        logger.info("正在加载优化模型...")
     
-    model = Qwen3ForSequenceClassification(args.checkpoint, num_labels=6)
+    model = OptimizedQwen3ForSequenceClassification(
+        args.checkpoint, 
+        num_labels=6, 
+        loss_type=args.loss_type, 
+        loss_config=loss_config
+    )
     
-    # 配置LoRA - 优化参数设置
+    # 配置LoRA - 使用更优化的参数
     lora_config = LoraConfig(
         task_type=TaskType.SEQ_CLS,
-        r=args.lora_r,  # 可调参数：推荐范围 4-32
-        lora_alpha=args.lora_alpha,  # 可调参数：通常为r的2倍
-        lora_dropout=args.lora_dropout,  # 可调参数：0.05-0.3
-        target_modules=args.target_modules,  # 可扩展目标模块
-        modules_to_save=["lm_head"]
+        r=args.lora_r,  # 增大到16以获得更好表现
+        lora_alpha=args.lora_alpha,  # 增大到32
+        lora_dropout=args.lora_dropout,  # 保持0.1
+        target_modules=args.target_modules,  # 扩展目标模块
+        modules_to_save=["classifier", "lm_head"]  # 保存分类头
     )
     
     # 应用LoRA
@@ -598,8 +854,10 @@ def train_worker(rank, world_size, args):
         logger.info(f"  每轮步数: {steps_per_epoch}")
         logger.info(f"  总训练步数: {total_steps}")
         logger.info(f"  训练轮数: {args.num_epochs}")
+    
     # 改进的学习率调度器
     if args.scheduler_type == "linear":
+        from transformers import get_linear_schedule_with_warmup
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=args.warmup_steps,
@@ -635,7 +893,7 @@ def train_worker(rank, world_size, args):
     
     for epoch in range(args.num_epochs):
         if is_main_process:
-            logger.info(f"===== 开始第 {epoch + 1}/{args.num_epochs} 轮训练 =====")
+            logger.info(f"===== 开始第 {epoch + 1}/{args.num_epochs} 轮优化训练 =====")
         
         # 设置分布式采样器的epoch
         train_sampler.set_epoch(epoch)
@@ -741,9 +999,9 @@ def train_worker(rank, world_size, args):
                         if improved:
                             patience_counter = 0
                             model_to_save = model.module if hasattr(model, 'module') else model
-                            model_to_save.save_pretrained(os.path.join(args.output_dir, 'best_model'))
-                            tokenizer.save_pretrained(os.path.join(args.output_dir, 'best_model'))
-                            logger.info(f"保存最佳模型，F1: {val_results['f1']:.4f}, Loss: {val_results['loss']:.4f}")
+                            model_to_save.save_pretrained(os.path.join(args.output_dir, 'best_model_optimized'))
+                            tokenizer.save_pretrained(os.path.join(args.output_dir, 'best_model_optimized'))
+                            logger.info(f"保存最佳优化模型，F1: {val_results['f1']:.4f}, Loss: {val_results['loss']:.4f}")
                         else:
                             patience_counter += 1
                             logger.info(f"验证指标未改善，耐心计数: {patience_counter}/{early_stopping_patience}")
@@ -761,9 +1019,9 @@ def train_worker(rank, world_size, args):
                 # 定期保存检查点
                 if global_step % args.save_steps == 0 and is_main_process:
                     model_to_save = model.module if hasattr(model, 'module') else model
-                    checkpoint_dir = os.path.join(args.output_dir, f'checkpoint-{global_step}')
+                    checkpoint_dir = os.path.join(args.output_dir, f'checkpoint-optimized-{global_step}')
                     model_to_save.save_pretrained(checkpoint_dir)
-                    logger.info(f"保存检查点到: {checkpoint_dir}")
+                    logger.info(f"保存优化检查点到: {checkpoint_dir}")
         
         # Epoch结束后的评估
         val_results = evaluate(model, val_loader, device, rank)
@@ -783,11 +1041,11 @@ def train_worker(rank, world_size, args):
             logger.info(f"    总漏报率: {val_results['total_miss_rate']:.4f}")
             
             # 每个epoch结束后保存LoRA模型
-            epoch_output_dir = os.path.join(args.output_dir, f'epoch-{epoch + 1}')
+            epoch_output_dir = os.path.join(args.output_dir, f'epoch-optimized-{epoch + 1}')
             model_to_save = model.module if hasattr(model, 'module') else model
             model_to_save.save_pretrained(epoch_output_dir)
             tokenizer.save_pretrained(epoch_output_dir)
-            logger.info(f"已保存第 {epoch + 1} 个epoch的LoRA模型到: {epoch_output_dir}")
+            logger.info(f"已保存第 {epoch + 1} 个epoch的优化LoRA模型到: {epoch_output_dir}")
     
     # 确保所有进程都完成训练后再清理
     if torch.distributed.is_initialized():
@@ -801,28 +1059,44 @@ def main():
     # 基础配置
     parser.add_argument('--checkpoint', type=str,
                        default="/home/users/sx_zhuzz/folder/LLaMA-Factory/mymodels/Qwen3-1.7B")
-    parser.add_argument('--train_data', type=str, default="../data/balanced_train3.csv")
-    parser.add_argument('--val_data', type=str, default="../data/balanced_val3.csv")
-    parser.add_argument('--test_data', type=str, default="../data/test3.csv")
-    parser.add_argument('--output_dir', type=str, default="../lora-20250714")
+    parser.add_argument('--train_data', type=str, default="./data/r789-b-50000_train.xlsx")
+    parser.add_argument('--val_data', type=str, default="./data/r789-b-50000_val.xlsx")
+    parser.add_argument('--test_data', type=str, default="./data/r789-b-50000_test.xlsx")
+    parser.add_argument('--output_dir', type=str, default="./lora-focal-73-1523")
     
     # 训练超参数
     parser.add_argument('--num_epochs', type=int, default=15)
     parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--learning_rate', type=float, default=5e-5)
+    parser.add_argument('--learning_rate', type=float, default=3e-5)  # 略微降低学习率以配合新损失函数
     parser.add_argument('--max_length', type=int, default=256)
     parser.add_argument('--gradient_accumulation_steps', type=int, default=4)
     
-    # LoRA参数
-    parser.add_argument('--lora_r', type=int, default=8,
-                       help='LoRA秩，推荐范围: 4-32，越大参数越多但效果可能更好')
-    parser.add_argument('--lora_alpha', type=int, default=16,
-                       help='LoRA缩放因子，通常设为r的2倍')
+    # LoRA参数 - 优化配置
+    parser.add_argument('--lora_r', type=int, default=16,  # 增大到16
+                       help='LoRA秩，增大以获得更好表现')
+    parser.add_argument('--lora_alpha', type=int, default=32,  # 增大到32
+                       help='LoRA缩放因子')
     parser.add_argument('--lora_dropout', type=float, default=0.1,
-                       help='LoRA dropout率，范围: 0.05-0.3')
+                       help='LoRA dropout率')
     parser.add_argument('--target_modules', type=str, nargs='+',
                        default=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-                       help='LoRA目标模块，可以包含更多线性层以提升效果')
+                       help='LoRA目标模块')
+    
+    # 损失函数配置 - 新增
+    parser.add_argument('--loss_type', type=str, default='focal',
+                       choices=['focal', 'weighted_ce', 'combined', 'standard'],
+                       help='损失函数类型')
+    parser.add_argument('--focal_gamma', type=float, default=2.0,
+                       help='Focal Loss的gamma参数，控制聚焦程度')
+    parser.add_argument('--focal_alpha', type=str, default='auto',
+                       help='Focal Loss的alpha参数，可以是auto或具体数值')
+    parser.add_argument('--class_weight_method', type=str, default='custom',
+                       choices=['inverse_freq', 'balanced', 'custom'],
+                       help='类别权重计算方法')
+    parser.add_argument('--focal_weight', type=float, default=0.7,
+                       help='组合损失中Focal Loss的权重')
+    parser.add_argument('--ce_weight', type=float, default=0.3,
+                       help='组合损失中交叉熵的权重')
     
     # 优化器参数
     parser.add_argument('--weight_decay', type=float, default=0.01,
@@ -845,7 +1119,7 @@ def main():
                        help='多项式调度器的幂次')
     
     # 早停机制
-    parser.add_argument('--early_stopping_patience', type=int, default=3,
+    parser.add_argument('--early_stopping_patience', type=int, default=5,  # 增加耐心值
                        help='早停耐心值，连续多少次评估无改善后停止训练')
     parser.add_argument('--early_stopping_metric', type=str, default="f1",
                        choices=["f1", "loss"],
@@ -859,7 +1133,7 @@ def main():
     # 系统配置
     parser.add_argument('--fp16', action='store_true', default=True)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--gpu_ids', type=str, default="1,2,3,4,5,7",
+    parser.add_argument('--gpu_ids', type=str, default="0,1,2,3,4,5",
                        help='指定使用的GPU ID，用逗号分隔，例如: 0,1,2 或 0,2,4')
     parser.add_argument('--num_gpus', type=int, default=None,
                        help='指定使用的GPU数量，从GPU 0开始使用')
@@ -904,9 +1178,12 @@ def main():
         print("警告: 只使用1个GPU，建议使用单GPU训练脚本")
     
     # 记录训练开始信息
-    print(f"开始启动多进程训练，世界大小: {world_size}")
+    print(f"开始启动优化版多进程训练，世界大小: {world_size}")
     print(f"输出目录: {args.output_dir}")
-    print(f"日志将保存到: {os.path.join(args.output_dir, 'training.log')}")
+    print(f"损失函数类型: {args.loss_type}")
+    print(f"Focal Loss gamma: {args.focal_gamma}")
+    print(f"类别权重方法: {args.class_weight_method}")
+    print(f"日志将保存到: {os.path.join(args.output_dir, 'training_optimized.log')}")
     
     # 启动多进程训练
     mp.spawn(train_worker, args=(world_size, args), nprocs=world_size, join=True)

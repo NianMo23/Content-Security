@@ -26,7 +26,7 @@ def set_seed(seed=23):
 # 自定义数据集类
 class ClassificationDataset(Dataset):
     def __init__(self, data_path, tokenizer, max_length=512):
-        self.data = pd.read_csv(data_path)
+        self.data = pd.read_excel(data_path)
         self.tokenizer = tokenizer
         self.max_length = max_length
         
@@ -801,10 +801,10 @@ def main():
     # 基础配置
     parser.add_argument('--checkpoint', type=str,
                        default="/home/users/sx_zhuzz/folder/LLaMA-Factory/mymodels/Qwen3-1.7B")
-    parser.add_argument('--train_data', type=str, default="../data/balanced_train3.csv")
-    parser.add_argument('--val_data', type=str, default="../data/balanced_val3.csv")
-    parser.add_argument('--test_data', type=str, default="../data/test3.csv")
-    parser.add_argument('--output_dir', type=str, default="../lora-20250714")
+    parser.add_argument('--train_data', type=str, default="./data/r789-b-50000_train.xlsx")
+    parser.add_argument('--val_data', type=str, default="./data/r789-b-50000_val.xlsx")
+    parser.add_argument('--test_data', type=str, default="./data/r789-b-50000_test.xlsx")
+    parser.add_argument('--output_dir', type=str, default="./lora-72-1815")
     
     # 训练超参数
     parser.add_argument('--num_epochs', type=int, default=15)
@@ -859,7 +859,7 @@ def main():
     # 系统配置
     parser.add_argument('--fp16', action='store_true', default=True)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--gpu_ids', type=str, default="1,2,3,4,5,7",
+    parser.add_argument('--gpu_ids', type=str, default="0,1,2,3,4,5",
                        help='指定使用的GPU ID，用逗号分隔，例如: 0,1,2 或 0,2,4')
     parser.add_argument('--num_gpus', type=int, default=None,
                        help='指定使用的GPU数量，从GPU 0开始使用')

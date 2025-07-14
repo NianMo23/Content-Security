@@ -15,7 +15,7 @@ from datetime import datetime
 # 自定义数据集类
 class ClassificationDataset(Dataset):
     def __init__(self, data_path, tokenizer, max_length=512):
-        self.data = pd.read_csv(data_path)
+        self.data = pd.read_excel(data_path)
         self.tokenizer = tokenizer
         self.max_length = max_length
         
@@ -234,7 +234,7 @@ def main():
                         help="原始模型的路径")
     parser.add_argument('--lora_model', type=str, required=False, default="./lora-72-1815/epoch-6",
                         help="保存的LoRA模型路径")
-    parser.add_argument('--test_data', type=str, required=False, default="./data/r789-b-50000_test.csv",
+    parser.add_argument('--test_data', type=str, required=False, default="./data/r789-b-50000_test.xlsx",
                         help="测试数据集路径")
     parser.add_argument('--batch_size', type=int, default=18)
     parser.add_argument('--max_length', type=int, default=256)

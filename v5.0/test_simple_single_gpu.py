@@ -2,20 +2,28 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
-from peft import LoraConfig, get_peft_model, TaskType, PeftModel
+from peft import PeftModel
 import pandas as pd
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
 import os
 import argparse
 from tqdm import tqdm
-from qwen3_classification_direct import Qwen3ForSequenceClassification
+from qwen3_simple_model import Qwen3ForClassification
 from datetime import datetime
+import json
+import gc
+
+# 设置随机种子
+def set_seed(seed=42):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 # 自定义数据集类
 class ClassificationDataset(Dataset):
     def __init__(self, data_path, tokenizer, max_length=512):
-        self.data = pd.read_csv(data_path)
+        self.data = pd.read_excel(data_path)
         self.tokenizer = tokenizer
         self.max_length = max_length
         
@@ -59,36 +67,76 @@ class ClassificationDataset(Dataset):
         return {
             'input_ids': encoding['input_ids'].squeeze(),
             'attention_mask': encoding['attention_mask'].squeeze(),
-            'labels': torch.tensor(label, dtype=torch.long)
+            'labels': torch.tensor(label, dtype=torch.long),
+            'text': text  # 保留原始文本
         }
 
-# 评估函数 - 包含漏报误报分析
-def evaluate(model, dataloader, device):
+# 评估函数 - 单GPU版本，内存优化
+def evaluate(model, dataloader, device, use_fp16=True):
     model.eval()
     all_preds = []
     all_labels = []
     total_loss = 0
+    batch_count = 0
+    
+    # 获取模型数据类型
+    model_dtype = next(model.parameters()).dtype
+    
+    # 减少显存使用的设置
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = False
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
-            
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels
-            )
-            
-            loss = outputs.loss
-            logits = outputs.logits
-            
-            total_loss += loss.item()
-            
-            preds = torch.argmax(logits, dim=-1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating")):
+            try:
+                input_ids = batch['input_ids'].to(device, non_blocking=True)
+                attention_mask = batch['attention_mask'].to(device, non_blocking=True)
+                labels = batch['labels'].to(device, non_blocking=True)
+                
+                # 混合精度推理
+                with torch.amp.autocast('cuda', enabled=use_fp16, dtype=torch.float16 if model_dtype != torch.bfloat16 else torch.bfloat16):
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels
+                    )
+                
+                loss = outputs.loss
+                logits = outputs.logits
+                
+                total_loss += loss.item()
+                batch_count += 1
+                
+                # 立即转移到CPU并转换为numpy，减少GPU内存占用
+                preds = torch.argmax(logits, dim=-1).cpu().numpy()
+                labels_np = labels.cpu().numpy()
+                
+                all_preds.extend(preds)
+                all_labels.extend(labels_np)
+                
+                # 立即清理GPU上的张量
+                del input_ids, attention_mask, labels, outputs, loss, logits, preds
+                
+                # 每5个batch清理一次缓存
+                if batch_idx % 5 == 0:
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"内存不足在batch {batch_idx}, 跳过此batch")
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    continue
+                else:
+                    raise e
+    
+    # 最终清理
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    # 计算平均loss
+    avg_loss = total_loss / max(batch_count, 1)
     
     # 计算基础指标
     accuracy = accuracy_score(all_labels, all_preds)
@@ -195,8 +243,6 @@ def evaluate(model, dataloader, device):
         tn, fp, fn, tp = 0, 0, 0, 0
         binary_accuracy = 0.0
     
-    avg_loss = total_loss / len(dataloader)
-    
     return {
         'loss': avg_loss,
         'accuracy': accuracy,
@@ -211,20 +257,20 @@ def evaluate(model, dataloader, device):
         'per_class_f1': f1_per_class,
         'per_class_support': support_per_class,
         # 漏报误报分析结果
-        'per_class_miss_rate': per_class_miss_rate,           # 每类的漏报率（被误判为正常的比例）
-        'total_miss_rate': total_miss_rate,                   # 总漏报率（所有异常->正常）
-        'total_miss_count': int(total_miss_to_normal_count),  # 总漏报数量
-        'total_abnormal_count': int(total_abnormal_count),    # 总异常样本数
-        'normal_false_positive_rate': normal_false_positive_rate,       # 正常的误报率
-        'normal_false_positive_count': int(normal_false_positive_count), # 正常误报数量
-        'normal_total_count': int(normal_count),              # 正常样本总数
-        'normal_misclassified_to': normal_misclassified_to,   # 正常被误判为各异常类别的详情
-        'binary_accuracy': binary_accuracy,                  # 二分类准确率
+        'per_class_miss_rate': per_class_miss_rate,
+        'total_miss_rate': total_miss_rate,
+        'total_miss_count': int(total_miss_to_normal_count),
+        'total_abnormal_count': int(total_abnormal_count),
+        'normal_false_positive_rate': normal_false_positive_rate,
+        'normal_false_positive_count': int(normal_false_positive_count),
+        'normal_total_count': int(normal_count),
+        'normal_misclassified_to': normal_misclassified_to,
+        'binary_accuracy': binary_accuracy,
         'binary_confusion_matrix': {
-            'true_negative': int(tn),   # 正常->正常
-            'false_positive': int(fp),  # 正常->异常
-            'false_negative': int(fn),  # 异常->正常
-            'true_positive': int(tp)    # 异常->异常
+            'true_negative': int(tn),
+            'false_positive': int(fp),
+            'false_negative': int(fn),
+            'true_positive': int(tp)
         }
     }
 
@@ -232,57 +278,84 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', type=str, required=False, default="/home/users/sx_zhuzz/folder/LLaMA-Factory/mymodels/Qwen3-1.7B",
                         help="原始模型的路径")
-    parser.add_argument('--lora_model', type=str, required=False, default="./lora-72-1815/epoch-6",
+    parser.add_argument('--lora_model', type=str, required=False, default="../simple-model-output/best_model",
                         help="保存的LoRA模型路径")
-    parser.add_argument('--test_data', type=str, required=False, default="./data/r789-b-50000_test.csv",
+    parser.add_argument('--test_data', type=str, required=False, default="../data/r789-b-50000.xlsx",
                         help="测试数据集路径")
-    parser.add_argument('--batch_size', type=int, default=18)
+    parser.add_argument('--batch_size', type=int, default=4)  # 更小的默认批次大小
     parser.add_argument('--max_length', type=int, default=256)
+    
+    # GPU配置
+    parser.add_argument('--gpu_id', type=int, default=0,
+                        help='指定使用的GPU ID')
+    parser.add_argument('--fp16', action='store_true', default=True,
+                        help='使用混合精度推理')
+    parser.add_argument('--clear_cache', action='store_true', default=True,
+                        help='测试前清理GPU缓存')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='随机种子')
     
     args = parser.parse_args()
     
+    # 检查CUDA可用性
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA不可用，无法进行GPU测试")
+    
     # 设置设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(f'cuda:{args.gpu_id}')
+    torch.cuda.set_device(args.gpu_id)
+    
+    # 清理GPU缓存
+    if args.clear_cache:
+        torch.cuda.empty_cache()
+        gc.collect()
+    
+    # 设置随机种子
+    set_seed(args.seed)
+    
     print(f"使用设备: {device}")
+    print(f"开始单GPU测试")
     
     # 加载tokenizer
-    print("加载tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
     # 加载基础模型
-    print("加载基础模型...")
-    base_model = Qwen3ForSequenceClassification(args.checkpoint, num_labels=6)
+    print("加载简化模型...")
+    base_model = Qwen3ForClassification(args.checkpoint)
     
     # 直接从保存的LoRA模型加载
     print(f"加载LoRA模型: {args.lora_model}")
-    model = PeftModel.from_pretrained(base_model, args.lora_model)
+    model = PeftModel.from_pretrained(base_model.model, args.lora_model)
+    base_model.model = model
     
     # 将模型移到设备
-    model.to(device)
-    model.eval()
+    base_model.to(device)
+    base_model.eval()
     
-    print("LoRA模型加载完成！")
-    print(f"模型已加载到 {device}")
+    print("简化LoRA模型加载完成！")
     
     # 准备测试数据集
     print("加载测试数据集...")
     test_dataset = ClassificationDataset(args.test_data, tokenizer, args.max_length)
+    print(f"测试集样本数: {len(test_dataset)}")
+    
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True
+        num_workers=1,  # 减少worker数量
+        pin_memory=False,  # 关闭pin_memory减少内存使用
+        drop_last=False
     )
     
     # 评估模型
-    print("\n开始评估...")
-    test_results = evaluate(model, test_loader, device)
+    print("\n开始单GPU评估...")
+    test_results = evaluate(base_model, test_loader, device, use_fp16=args.fp16)
     
     # 打印基础结果
-    print("\n=== 测试集结果 ===")
+    print("\n=== 单GPU测试集结果 ===")
     print(f"Loss: {test_results['loss']:.4f}")
     print(f"6分类准确率: {test_results['accuracy']:.4f}")
     print(f"F1: {test_results['f1']:.4f}")
@@ -294,18 +367,10 @@ def main():
     print("\n=== 【正常类误报分析】 ===")
     print(f"正常内容误报率: {test_results['normal_false_positive_rate']:.4f} "
           f"({test_results['normal_false_positive_count']}/{test_results['normal_total_count']})")
-    if test_results['normal_misclassified_to']:
-        print("正常被误判为各异常类的详情:")
-        for class_name, info in test_results['normal_misclassified_to'].items():
-            if info['count'] > 0:
-                print(f"  -> {class_name}: {info['rate']:.4f} ({info['count']}条)")
     
     print("\n=== 【异常类漏报分析】 ===")
     print(f"总漏报率(异常->正常): {test_results['total_miss_rate']:.4f} "
           f"({test_results['total_miss_count']}/{test_results['total_abnormal_count']})")
-    print("各异常类漏报率(被误判为正常):")
-    for class_name, info in test_results['per_class_miss_rate'].items():
-        print(f"  {class_name}: {info['rate']:.4f} ({info['count']}/{info['total']})")
     
     # 定义标签名称
     label_names = ['正常', '歧视', '违法违规', '政治安全', '暴恐', '色情低俗']
@@ -323,58 +388,64 @@ def main():
             sup = test_results['per_class_support'][i]
             print(f"{label_name:<10} {acc:<8.4f} {prec:<8.4f} {rec:<8.4f} {f1:<8.4f} {sup:<8}")
     
-    # 打印混淆矩阵
-    cm = confusion_matrix(test_results['labels'], test_results['predictions'])
-    print("\n=== 混淆矩阵 ===")
-    print(cm)
-    
     # 保存结果
-    import json
     output_dir = os.path.dirname(args.lora_model)
-    # 添加时间戳到文件名
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_file = os.path.join(output_dir, f'test_results_with_analysis_{timestamp}.json')
+    results_file = os.path.join(output_dir, f'simple_single_gpu_test_results_{timestamp}.json')
     
     with open(results_file, 'w', encoding='utf-8') as f:
         json.dump({
-            'loss': test_results['loss'],
-            'accuracy': test_results['accuracy'],
-            'f1': test_results['f1'],
-            'precision': test_results['precision'],
-            'recall': test_results['recall'],
-            'binary_accuracy': test_results['binary_accuracy'],
-            'per_class_metrics': {
-                label_names[i]: {
-                    'accuracy': test_results['per_class_accuracy'][i],
-                    'precision': test_results['per_class_precision'][i],
-                    'recall': test_results['per_class_recall'][i],
-                    'f1': test_results['per_class_f1'][i],
-                    'support': int(test_results['per_class_support'][i])
-                } for i in range(len(label_names))
+            'test_config': {
+                'gpu_id': args.gpu_id,
+                'model_path': args.lora_model,
+                'test_data': args.test_data,
+                'batch_size': args.batch_size,
+                'max_length': args.max_length,
+                'fp16': args.fp16,
+                'timestamp': timestamp,
+                'model_type': 'simple_qwen3_with_lora'
             },
-            # 漏报误报分析结果
-            'miss_report_analysis': {
-                'total_miss_rate': test_results['total_miss_rate'],
-                'total_miss_count': test_results['total_miss_count'],
-                'total_abnormal_count': test_results['total_abnormal_count'],
-                'per_class_miss_rate': test_results['per_class_miss_rate']
-            },
-            'false_positive_analysis': {
-                'normal_false_positive_rate': test_results['normal_false_positive_rate'],
-                'normal_false_positive_count': test_results['normal_false_positive_count'],
-                'normal_total_count': test_results['normal_total_count'],
-                'normal_misclassified_to': test_results['normal_misclassified_to']
-            },
-            'binary_confusion_matrix': test_results['binary_confusion_matrix']
+            'results': {
+                'loss': test_results['loss'],
+                'accuracy': test_results['accuracy'],
+                'f1': test_results['f1'],
+                'precision': test_results['precision'],
+                'recall': test_results['recall'],
+                'binary_accuracy': test_results['binary_accuracy'],
+                'per_class_metrics': {
+                    label_names[i]: {
+                        'accuracy': test_results['per_class_accuracy'][i],
+                        'precision': test_results['per_class_precision'][i],
+                        'recall': test_results['recall'][i],
+                        'f1': test_results['per_class_f1'][i],
+                        'support': int(test_results['per_class_support'][i])
+                    } for i in range(len(label_names))
+                },
+                'miss_report_analysis': {
+                    'total_miss_rate': test_results['total_miss_rate'],
+                    'total_miss_count': test_results['total_miss_count'],
+                    'total_abnormal_count': test_results['total_abnormal_count'],
+                    'per_class_miss_rate': test_results['per_class_miss_rate']
+                },
+                'false_positive_analysis': {
+                    'normal_false_positive_rate': test_results['normal_false_positive_rate'],
+                    'normal_false_positive_count': test_results['normal_false_positive_count'],
+                    'normal_total_count': test_results['normal_total_count'],
+                    'normal_misclassified_to': test_results['normal_misclassified_to']
+                },
+                'binary_confusion_matrix': test_results['binary_confusion_matrix']
+            }
         }, f, indent=4, ensure_ascii=False)
     
-    print(f"\n结果已保存到: {results_file}")
+    print(f"\n单GPU测试结果已保存到: {results_file}")
     
     # 关键业务指标总结
     print("\n=== 关键业务指标总结 ===")
     print(f"✓ 正常内容误报率: {test_results['normal_false_positive_rate']:.4f}")
     print(f"✓ 异常内容总漏报率: {test_results['total_miss_rate']:.4f}")
     print(f"✓ 二分类准确率(正常vs异常): {test_results['binary_accuracy']:.4f}")
+    print(f"✓ 使用了GPU: {args.gpu_id}")
+    print(f"✓ 模型类型: 简化Qwen3 + LoRA")
 
 if __name__ == "__main__":
     main()
